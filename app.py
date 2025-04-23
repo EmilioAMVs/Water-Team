@@ -1,79 +1,138 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, session
 import csv
 import time
-from flask import Flask, render_template, request, redirect, url_for, flash
 
 app = Flask(__name__)
-app.secret_key = 'supersecret-key'
+app.secret_key = 'cambiar_por_una_clave_segura'
 
-clientes = []
+REQUIRED_FIELDS = {'id', 'nombre', 'email', 'ciudad', 'edad', 'extra'}
 
 def parse_csv_stream(stream):
-    """Parsee el CSV del stream y retorne la lista de clientes válidos."""
-    parsed = []
-    reader = csv.DictReader(stream.read().decode('utf-8').splitlines())
-    for fila in reader:
+    """
+    Parsea el CSV desde el stream y retorna (clients, invalid_count).
+    - Valida encabezado: debe contener al menos los campos REQUIRED_FIELDS.
+    - Ignora registros mal formados o incompletos.
+    """
+    text = stream.read().decode('utf-8').splitlines()
+    reader = csv.DictReader(text)
+    
+    # Validar encabezado
+    headers = set(reader.fieldnames or [])
+    if not REQUIRED_FIELDS.issubset(headers):
+        raise ValueError(
+            f"El CSV debe contener las columnas: {', '.join(REQUIRED_FIELDS)}"
+        )
+    
+    clients = []
+    invalid = 0
+    for row in reader:
         try:
-            parsed.append({
-                'id': int(fila['id']),
-                'nombre': fila['nombre'],
-                'email': fila['email'],
-                'ciudad': fila['ciudad'],
-                'edad': int(fila['edad'])
-            })
-        except (ValueError, KeyError):
-            # Omitir registros mal formados
+            # Validar cada campo requerido
+            for k in REQUIRED_FIELDS:
+                if row.get(k) is None or row[k].strip() == '':
+                    raise ValueError()
+            cid = int(row['id'])
+            age = int(row['edad'])
+        except Exception:
+            invalid += 1
             continue
-    return parsed
+        clients.append({
+            'id': cid,
+            'nombre': row['nombre'].strip(),
+            'email': row['email'].strip(),
+            'ciudad': row['ciudad'].strip(),
+            'edad': age,
+            'extra': row['extra'].strip()
+        })
+    return clients, invalid
 
 @app.route('/', methods=['GET'])
-def index():
-    # Si no hay clientes aún, solo muestro el form de subida
-    return render_template('index.html', clientes=clientes, tiempo=None)
+def upload_view():
+    session.clear()
+    return render_template('upload.html')
 
 @app.route('/upload', methods=['POST'])
 def upload():
-    global clientes
     file = request.files.get('csv_file')
     if not file or not file.filename.lower().endswith('.csv'):
-        flash('Error: Solo se permiten archivos con extensión .csv', 'danger')
-        return redirect(url_for('index'))
-
+        flash('Error: solo archivos con extensión .csv', 'danger')
+        return redirect(url_for('upload_view'))
     try:
-        clientes = parse_csv_stream(file.stream)
-        flash(f'Archivo cargado correctamente: {len(clientes)} registros válidos', 'success')
+        clients, invalid = parse_csv_stream(file.stream)
+    except ValueError as e:
+        flash(f'Error de CSV: {e}', 'danger')
+        return redirect(url_for('upload_view'))
     except Exception as e:
-        flash(f'Error al procesar el archivo: {e}', 'danger')
-        clientes = []
+        flash(f'Error al procesar CSV: {e}', 'danger')
+        return redirect(url_for('upload_view'))
 
-    return redirect(url_for('index'))
+    # Guardar en sesión
+    session['clients'] = clients
+    session['invalid'] = invalid
+    session['view_clients'] = clients[:]  # copia
+    flash(f'Archivo cargado: {len(clients)} válidos, {invalid} inválidos', 'success')
+    return redirect(url_for('dashboard'))
+
+@app.route('/dashboard', methods=['GET'])
+def dashboard():
+    if 'clients' not in session:
+        return redirect(url_for('upload_view'))
+    return render_template(
+        'dashboard.html',
+        clients=session.get('view_clients', []),
+        invalid=session.get('invalid', 0),
+        tiempo=session.pop('tiempo', None)
+    )
+
+@app.route('/reset_all')
+def reset_all():
+    session.clear()
+    return redirect(url_for('upload_view'))
+
+@app.route('/clear_filters')
+def clear_filters():
+    session['view_clients'] = session.get('clients', [])
+    return redirect(url_for('dashboard'))
 
 @app.route('/buscar', methods=['POST'])
 def buscar():
-    inicio = time.perf_counter()
-    client_id = request.form.get('id')
-    resultado = next((c for c in clientes if str(c['id']) == client_id), None)
-    tiempo = round((time.perf_counter() - inicio) * 1000, 2)
-    if not resultado:
-        flash("Cliente no encontrado", "warning")
-        return render_template('index.html', clientes=[], tiempo=tiempo)
-    return render_template('index.html', clientes=[resultado], tiempo=tiempo)
+    cid_str = request.form.get('id','').strip()
+    try:
+        cid = int(cid_str)
+    except ValueError:
+        flash('ID inválido', 'warning')
+        return redirect(url_for('dashboard'))
+    start = time.perf_counter()
+    result = next((c for c in session['clients'] if c['id'] == cid), None)
+    ms = round((time.perf_counter() - start)*1000, 2)
+    session['tiempo'] = ms
+    if result:
+        session['view_clients'] = [result]
+    else:
+        session['view_clients'] = []
+        flash('Cliente no encontrado', 'warning')
+    return redirect(url_for('dashboard'))
 
 @app.route('/ciudad', methods=['POST'])
 def por_ciudad():
-    ciudad = request.form.get('ciudad', '').lower()
-    inicio = time.perf_counter()
-    filtrados = [c for c in clientes if c['ciudad'].lower() == ciudad]
-    tiempo = round((time.perf_counter() - inicio) * 1000, 2)
-    if not filtrados:
-        flash("No hay clientes en esa ciudad", "warning")
-    return render_template('index.html', clientes=filtrados, tiempo=tiempo)
+    city = request.form.get('ciudad','').strip().lower()
+    start = time.perf_counter()
+    filtered = [c for c in session['clients'] if c['ciudad'].lower() == city]
+    ms = round((time.perf_counter() - start)*1000, 2)
+    session['tiempo'] = ms
+    if not filtered:
+        flash('No hay clientes en esa ciudad', 'warning')
+    session['view_clients'] = filtered
+    return redirect(url_for('dashboard'))
 
-@app.route('/ordenar', methods=['GET'])
+@app.route('/ordenar')
 def ordenar():
-    inicio = time.perf_counter()
-    ordenados = sorted(clientes, key=lambda x: (x['edad'], x['id']))
-    tiempo = round((time.perf_counter() - inicio) * 1000, 2)
-    return render_template('index.html', clientes=ordenados, tiempo=tiempo)
+    start = time.perf_counter()
+    ordered = sorted(session.get('clients', []), key=lambda c: (c['edad'], c['id']))
+    ms = round((time.perf_counter() - start)*1000, 2)
+    session['tiempo'] = ms
+    session['view_clients'] = ordered
+    return redirect(url_for('dashboard'))
 
 if __name__ == '__main__':
     app.run(debug=True)
